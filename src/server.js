@@ -10,7 +10,16 @@ import { z } from "zod";
 import { env } from "./env.js";
 import { migrate, openDb } from "./db.js";
 import { seedIfEmpty } from "./seed.js";
-import { fetchOerCurrencies, fetchOerLatest, upsertFxRatesFromLatest } from "./fx.js";
+import {
+  fetchCoinGeckoPrices,
+  fetchFrankfurterCurrencies,
+  fetchFrankfurterLatest,
+  fetchOerCurrencies,
+  fetchOerLatest,
+  upsertFxRatesFromCoinGecko,
+  upsertFxRatesFromFrankfurter,
+  upsertFxRatesFromLatest,
+} from "./fx.js";
 
 const app = Fastify({ logger: true });
 
@@ -244,17 +253,31 @@ app.get("/fx/status", async () => {
   return {
     updated_at: row?.updated_at ?? null,
     count: Number(row?.count ?? 0),
-    source: "openexchangerates",
+    provider: env.fxProvider,
     include_alternative: Boolean(env.fxIncludeAlternative),
     auto_refresh_seconds: Number(env.fxAutoRefreshSeconds),
-    configured: Boolean(env.oerAppId),
+    configured:
+      env.fxProvider === "openexchangerates" ? Boolean(env.oerAppId) : true,
+    crypto_ids: env.cryptoIds.split(",").map((s) => s.trim()).filter(Boolean),
   };
 });
 
 app.get("/fx/symbols", async () => {
-  const res = await fetchOerCurrencies({ includeAlternative: env.fxIncludeAlternative });
-  if (!res.ok) return { ok: false, error: res.error, status: res.status, body: res.body };
-  return { ok: true, symbols: res.data };
+  if (env.fxProvider === "openexchangerates") {
+    const res = await fetchOerCurrencies({ includeAlternative: env.fxIncludeAlternative });
+    if (!res.ok) return { ok: false, error: res.error, status: res.status, body: res.body };
+    return { ok: true, symbols: res.data };
+  }
+
+  const fiat = await fetchFrankfurterCurrencies();
+  if (!fiat.ok) return { ok: false, error: fiat.error, status: fiat.status, body: fiat.body };
+  const cryptoIds = env.cryptoIds.split(",").map((s) => s.trim()).filter(Boolean);
+  return {
+    ok: true,
+    fiat: fiat.data,
+    crypto_ids: cryptoIds,
+    note: "Crypto-Symbole werden aus den konfigurierten CoinGecko IDs abgeleitet.",
+  };
 });
 
 // --- Admin: Produkte pflegen ---
@@ -376,34 +399,51 @@ app.put("/admin/fx/rates", { preHandler: requireAdmin }, async (req, reply) => {
 });
 
 app.post("/admin/fx/refresh", { preHandler: requireAdmin }, async (req, reply) => {
-  const latest = await fetchOerLatest({ includeAlternative: env.fxIncludeAlternative });
-  if (!latest.ok) {
-    return reply.code(502).send(latest);
-  }
-  const info = upsertFxRatesFromLatest(db, latest.data);
-  return { ok: true, ...info };
+  const res = await fxRefreshNow();
+  if (!res.ok) return reply.code(502).send(res);
+  return res;
 });
 
-// Auto-Refresh (OpenExchangeRates) im Hintergrund
-async function fxAutoRefreshOnce() {
-  if (!env.oerAppId) return;
+async function fxRefreshNow() {
   try {
-    const latest = await fetchOerLatest({ includeAlternative: env.fxIncludeAlternative });
-    if (!latest.ok) {
-      app.log.warn({ latest }, "FX refresh failed");
-      return;
+    if (env.fxProvider === "openexchangerates") {
+      if (!env.oerAppId) return { ok: false, error: "missing_app_id" };
+      const latest = await fetchOerLatest({ includeAlternative: env.fxIncludeAlternative });
+      if (!latest.ok) return latest;
+      const info = upsertFxRatesFromLatest(db, latest.data);
+      return { ok: true, provider: "openexchangerates", ...info };
     }
-    const info = upsertFxRatesFromLatest(db, latest.data);
-    app.log.info({ info }, "FX refreshed");
+
+    // no-key: Frankfurter (fiat) + CoinGecko (crypto)
+    const fiatLatest = await fetchFrankfurterLatest({ base: "USD" });
+    if (!fiatLatest.ok) return { ok: false, provider: "frankfurter", ...fiatLatest };
+    const fiatInfo = upsertFxRatesFromFrankfurter(db, fiatLatest.data);
+
+    const ids = env.cryptoIds.split(",").map((s) => s.trim()).filter(Boolean);
+    let cryptoInfo = { base: "USD", updated_at: new Date().toISOString(), count: 0 };
+    if (ids.length) {
+      const crypto = await fetchCoinGeckoPrices({ ids, vsCurrency: "usd" });
+      if (!crypto.ok) return { ok: false, provider: "coingecko", ...crypto };
+      cryptoInfo = upsertFxRatesFromCoinGecko(db, crypto.data, { baseFiat: "USD" });
+    }
+
+    return {
+      ok: true,
+      provider: "no-key",
+      fiat: { source: "frankfurter", ...fiatInfo },
+      crypto: { source: "coingecko", ...cryptoInfo },
+    };
   } catch (e) {
-    app.log.warn({ err: String(e) }, "FX refresh exception");
+    return { ok: false, error: "exception", message: String(e) };
   }
 }
 
 // initial + interval
-fxAutoRefreshOnce();
+fxRefreshNow().then((res) => app.log.info({ res }, "FX refreshed (startup)"));
 const fxIntervalMs = Math.max(60, Number(env.fxAutoRefreshSeconds || 3600)) * 1000;
-setInterval(fxAutoRefreshOnce, fxIntervalMs).unref();
+setInterval(() => {
+  fxRefreshNow().then((res) => app.log.info({ res }, "FX refreshed (interval)"));
+}, fxIntervalMs).unref();
 
 const CheckoutIn = z.object({
   email: z.string().email(),

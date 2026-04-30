@@ -68,6 +68,18 @@ Setze `FMS_OER_APP_ID` und (optional) den Refresh:
 - **`FMS_OER_APP_ID`**: dein OpenExchangeRates `app_id`
 - **`FMS_FX_REFRESH_SECONDS`**: z.B. `3600` (Default)
 - **`FMS_FX_INCLUDE_ALTERNATIVE`**: `true` lädt `show_alternative=1` (inkl. digital/alternative Symbole, z.B. BTC/ETH/LTC – je nach OER-Verfügbarkeit/Plan)
+Hinweis: **OpenExchangeRates funktioniert nicht ohne API-Key** (`app_id` ist Pflicht für `latest.json`).
+
+## Ohne API-Keys (Default)
+Standardmäßig läuft die FX-Schicht **ohne API-Keys**:
+- **Fiat** über **Frankfurter/ECB** (`https://api.frankfurter.app`)
+- **Crypto** über **CoinGecko** (kein Key; beachte Rate-Limits)
+
+Konfiguration:
+- **`FMS_FX_PROVIDER=no-key`** (Default)
+- **`FMS_CRYPTO_IDS`**: Komma-Liste von CoinGecko-IDs, die importiert werden sollen (z.B. `bitcoin,ethereum,solana,tether,usd-coin`)
+
+Hinweis: “Alle Crypto” (tausende Coins) ist ohne Key möglich, aber sehr schwergewichtig. Sinnvoll ist eine kuratierte Liste in `FMS_CRYPTO_IDS`.
 
 ## Hinweis zu Zahlungen
 Dieses MVP erstellt Bestellungen und speichert den gewünschten `payment_provider`, integriert aber (noch) keine Provider-APIs.
